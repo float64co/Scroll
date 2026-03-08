@@ -1,6 +1,6 @@
 ![scroll](img/scroll.png)
 
-A terminal IRC client written in Python. Buffers, a nick list, tab completion, and not much else.
+A terminal IRC client written in Python.
 
 ![screenshot](img/scroll_screenshot.png)
 
