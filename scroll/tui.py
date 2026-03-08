@@ -180,6 +180,8 @@ class NickPane(Pane):
                 if menu:
                     menu.open(nick)
                     self._tui.set_focus("menu")
+        elif character == 9:       # Tab — return to input
+            self._tui.set_focus("input")
         elif character == 27:      # ESC — return to input
             self._tui.set_focus("input")
 
@@ -193,6 +195,7 @@ MENU_ITEMS = [
     ("Deop",   "deop"),
     ("Kick",   "kick"),
     ("Ban",    "ban"),
+    ("Slap",   "slap"),
 ]
 MENU_WIDTH = max(len(label) for label, _ in MENU_ITEMS) + 4   # padding
 
@@ -253,6 +256,9 @@ class NickMenuPane(Pane):
             self.window.window.clear()
         elif character in (10, 13):  # Enter — execute
             self._execute(MENU_ITEMS[self.selected][1])
+        elif character == 9:       # Tab — close menu, return to input
+            self._tui.set_focus("input")
+            self.window.window.clear()
         elif character == 27:      # ESC — back to nick list
             self._tui.set_focus("nicks")
             self.window.window.clear()
@@ -291,6 +297,14 @@ class NickMenuPane(Pane):
         elif action == "ban":
             if irc and channel.startswith("#"):
                 irc.raw("MODE %s +b %s!*@*" % (channel, nick))
+            self._tui.set_focus("nicks")
+
+        elif action == "slap":
+            if irc and channel.startswith("#"):
+                irc.raw("PRIVMSG %s :\x01ACTION slaps %s around a bit with a large trout.\x01" % (channel, nick))
+                buf = self._tui.current_buffer()
+                if buf:
+                    buf.add(timestamp(), "", "* %s slaps %s around a bit with a large trout." % (irc.nick, nick))
             self._tui.set_focus("nicks")
 
         self.window.window.clear()
