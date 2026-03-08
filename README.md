@@ -21,6 +21,7 @@ config.hcl keys:
 
 Key bindings:
   Ctrl+N / Ctrl+P   next / previous buffer
+  Ctrl+X            cycle between server buffers
   Alt+1 .. Alt+9    jump directly to buffer N
   Ctrl+W            delete last word in input
   Ctrl+U            clear input line
