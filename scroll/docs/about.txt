@@ -1,0 +1,131 @@
+scroll
+======
+
+Author:  Luke Brooks <luke@float64.com>
+License: MIT
+
+
+WHAT IT IS
+----------
+
+scroll is a terminal IRC client written in Python.  It is built on top of
+window.py, a small ncurses abstraction that handles layout, panes, and the
+event loop.
+
+The immediate goal is a client that works without configuration: point it at
+a server in config.hcl and it connects, shows server messages, lets you join
+channels, and stays out of your way.
+
+The longer-term goal is a client that is fully scriptable from within the
+running process, with a built-in editor so that scripts can be written,
+tested, and reloaded without leaving the client.
+
+
+DESIGN PHILOSOPHY
+-----------------
+
+scroll borrows from two clients with very different audiences.
+
+irssi (1999, Timo Sirainen) got the architecture right: a clean buffer model,
+stable Perl scripting with a signal/hook system, and a status bar that shows
+you exactly where you are.  Its weakness is that the scripting API requires
+you to understand its internals, and editing scripts means switching to another
+terminal.
+
+mIRC (1995, Khaled Mardam-Bey) got the user experience right: an approachable
+event system (on PRIVMSG, on JOIN), aliases that feel like shell functions, and
+a built-in editor so the feedback loop between writing and running a script is
+seconds rather than minutes.  Its weakness is that mIRC Script is a closed
+language that does not compose with anything else.
+
+scroll aims to take the buffer model and signal architecture from irssi and
+the approachability and self-contained editing experience from mIRC, and
+implement both using Python as the scripting language so that there is no
+separate language to learn.
+
+
+SCRIPTING
+---------
+
+Scripts are Python files loaded from ~/.scroll/scripts/ at startup and
+reloadable at runtime with /reload.
+
+The API is event-driven.  A script registers handlers for IRC events:
+
+    from scroll.script import on, irc, echo
+
+    @on("privmsg")
+    def highlight(event):
+        if "scroll" in event.text.lower():
+            echo(event.target, "-- highlight: %s said: %s" % (event.nick, event.text))
+
+    @on("join")
+    def greet(event):
+        if event.nick != irc.nick:
+            irc.privmsg(event.channel, "welcome, %s" % event.nick)
+
+Events carry the parsed IRC message as attributes (nick, target, text, raw).
+The irc object exposes privmsg(), notice(), join(), part(), raw(), and nick.
+The echo() function writes a line to a named buffer without sending it to IRC.
+
+Aliases (custom slash commands) are registered with:
+
+    @on("command:greet")
+    def cmd_greet(args):
+        irc.privmsg(irc.current_channel, "hello, %s" % args)
+
+This makes /greet <nick> available in the input line.
+
+Timer-based callbacks:
+
+    @on("timer:60")
+    def ping_check(event):
+        echo("server", "-- 60 seconds elapsed")
+
+The scripting API is not yet implemented.  The event registration decorator,
+the irc proxy object, and the script loader are planned for a near release.
+This document will be updated when they land.  See: /doc scripting
+
+
+DOCUMENTATION
+-------------
+
+Documentation is read from within the client.  Use /doc to list topics or
+/doc <topic> to open a buffer containing that document.  /wc closes it.
+
+Available topics are .txt files installed with the package.  You can add your
+own to ~/.scroll/docs/ and they will appear in /doc listings.
+
+    /doc about        this document
+    /doc scripting    scripting API reference  (planned)
+    /doc config       configuration reference  (planned)
+
+
+ARCHITECTURE
+------------
+
+The codebase is intentionally small.
+
+    window.py         ncurses abstraction: Window, Pane subclasses, palette(),
+                      layout engine, event loop.  No IRC knowledge.
+
+    irc.py            Non-blocking IRC protocol layer.  Connects, parses RFC
+                      1459 messages, handles PING/PONG, queues outbound lines.
+                      No UI knowledge.
+
+    tui.py            Terminal UI.  Buffer management, nick list, input line,
+                      tab completion, focus model, overlay menu.  Speaks to
+                      irc.py through the IRCClient interface.
+
+    docs.py           Doc file discovery and loading.
+
+    __main__.py       Entry point.  Loads config.hcl, registers built-in
+                      commands, patches the window cycle, wires layers together.
+
+    docs/             Plain-text documentation files (this directory).
+
+
+BUGS AND CONTRIBUTIONS
+----------------------
+
+https://github.com/lukeb42/scroll

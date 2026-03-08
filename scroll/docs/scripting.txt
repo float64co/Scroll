@@ -1,0 +1,805 @@
+scripting
+=========
+
+scroll scripts are plain Python files loaded from your scripts_directory at
+startup.  Set it in config.hcl:
+
+    scripts_directory = "~/.scroll/scripts/"
+
+Every .py file in that directory is executed in sorted filename order when
+scroll starts.  Use /reload to re-execute all of them without restarting.
+
+Scripts live in their own namespace, but they import from scroll.script to
+interact with the running client.  That is the entire public API — no undocumented
+internals, no monkey-patching required.
+
+
+THE FOUR THINGS YOU IMPORT
+--------------------------
+
+    from scroll.script import on, irc, tui, echo
+
+on      Decorator factory.  Register a function as an event handler.
+irc     Proxy to the IRC connection.  Send messages, check your nick, etc.
+tui     Proxy to the UI.  Read buffers, switch windows, print status messages.
+echo    Write a line to a named buffer without sending it to IRC.
+
+That is everything.  The rest is regular Python.
+
+
+EVENTS
+------
+
+Register a handler with the @on("event_name") decorator.  When the event
+fires, your function is called with an Event object whose attributes depend
+on the event type.
+
+    from scroll.script import on, echo
+
+    @on("privmsg")
+    def log_everything(e):
+        echo("server", "[log] <%s/%s> %s" % (e.target, e.nick, e.text))
+
+The Event object is a simple attribute bag:  e.nick, e.text, etc.  You can
+also inspect it raw with e.raw (the unparsed IRC line as a string).
+
+Complete event table:
+
+    EVENT       ATTRIBUTES
+    ─────────────────────────────────────────────────────────────────────
+    connect     (none — fired when the server sends 001 Welcome)
+    privmsg     nick, target, text, raw
+    notice      nick, target, text, raw
+    action      nick, target, text, raw       (/me messages)
+    join        nick, channel, raw
+    part        nick, channel, reason, raw
+    quit        nick, reason, raw
+    kick        nick, channel, kicked, reason, raw
+    nick        old_nick, new_nick, raw
+    topic       nick, channel, text, raw
+    mode        nick, target, mode, raw
+
+Multiple handlers for the same event are all called in registration order.
+An exception in one handler does not prevent others from running — the error
+is printed to the server buffer.
+
+
+SLASH COMMANDS
+--------------
+
+Register a custom /command with the "command:<name>" event:
+
+    @on("command:hello")
+    def cmd_hello(args):
+        """/hello <nick> — greet someone loudly."""
+        irc.privmsg(irc.current_channel, "HELLO %s!!!" % args.strip())
+
+Your function receives the argument string directly (everything after the
+command name).  The docstring becomes the description shown in /help.
+
+After /reload, /hello is available immediately.
+
+
+THE IRC OBJECT
+--------------
+
+irc.nick                Your current nickname (string, read-only).
+irc.current_channel     Name of the active channel buffer, or "" if on status.
+irc.connected           True if connected to the server.
+
+irc.privmsg(target, text)   Send a PRIVMSG.
+irc.notice(target, text)    Send a NOTICE.
+irc.join(channel)           Join a channel.
+irc.part(channel, reason)   Leave a channel.
+irc.raw(line)               Send a raw IRC line (e.g. "WHOIS somenick").
+
+
+THE TUI OBJECT
+--------------
+
+tui.buffers                     List of all open Buffer objects.
+tui.current_buffer()            The Buffer currently visible.
+tui.get_buffer(name)            Find a buffer by name, or None.
+tui.get_or_add_buffer(name)     Find or create a buffer by name.
+tui.switch_to(index)            Switch to buffer at index.
+tui.server_msg(text)            Print a line to the server/status buffer.
+
+
+ECHO
+----
+
+echo(target, text) writes a line to a named buffer without sending anything
+to IRC.  If the buffer does not exist it is created.
+
+    echo("#general", "-- this appears only on your screen")
+    echo("server",   "-- system message")
+    echo("mylog",    "anything you want")
+
+It is the right tool for status messages, debug output, highlights, and
+anything that should be visible to you but not the channel.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EXAMPLE SCRIPTS
+---------------
+
+The examples below are complete, paste-ready scripts.  Put each one in its
+own file under your scripts_directory and /reload.
+
+
+────────────────────────────────────────────────────────────────────────────
+1.  HIGHLIGHT YOUR NICK
+    File: 01_highlight.py
+────────────────────────────────────────────────────────────────────────────
+
+Prints a coloured alert to your server buffer when someone mentions your
+nick in any channel.
+
+    from scroll.script import on, irc, echo
+
+    @on("privmsg")
+    def highlight(e):
+        if irc.nick.lower() in e.text.lower() and e.target != irc.nick:
+            echo("server",
+                 ">> HIGHLIGHT in %s: <%s> %s" % (e.target, e.nick, e.text))
+
+Simple, but it means you never miss a mention while you are scrolling another
+buffer.  Extend it to play a terminal bell:
+
+    @on("privmsg")
+    def highlight(e):
+        if irc.nick.lower() in e.text.lower() and e.target != irc.nick:
+            echo("server",
+                 ">> HIGHLIGHT in %s: <%s> %s" % (e.target, e.nick, e.text))
+            print("\a", end="", flush=True)   # terminal bell
+
+
+────────────────────────────────────────────────────────────────────────────
+2.  AUTO-GREET CHANNEL JOINERS
+    File: 02_greet.py
+────────────────────────────────────────────────────────────────────────────
+
+Sends a greeting whenever someone joins a channel you are in.  Skips your
+own joins so you do not greet yourself.
+
+    from scroll.script import on, irc
+
+    GREETINGS = {
+        "#scroll":   "welcome to #scroll, %s!  type /doc scripting to get started.",
+        "#python":   "hey %s, glad you found us.",
+    }
+
+    @on("join")
+    def greet(e):
+        if e.nick == irc.nick:
+            return
+        msg = GREETINGS.get(e.channel)
+        if msg:
+            irc.privmsg(e.channel, msg % e.nick)
+
+You can make it channel-agnostic and greet everyone:
+
+    @on("join")
+    def greet_everyone(e):
+        if e.nick != irc.nick:
+            irc.privmsg(e.channel, "welcome, %s :)" % e.nick)
+
+
+────────────────────────────────────────────────────────────────────────────
+3.  AUTO-REJOIN ON KICK
+    File: 03_rejoin.py
+────────────────────────────────────────────────────────────────────────────
+
+If you get kicked, wait two seconds and rejoin.  Simple, but you would be
+surprised how many IRC bots are just Python files like this one.
+
+    import threading
+    from scroll.script import on, irc, echo
+
+    @on("kick")
+    def rejoin_on_kick(e):
+        if e.kicked != irc.nick:
+            return
+        echo("server", "-- kicked from %s by %s (%s), rejoining in 2s..."
+             % (e.channel, e.nick, e.reason))
+        def _do_rejoin():
+            threading.Event().wait(2)
+            irc.join(e.channel)
+        threading.Thread(target=_do_rejoin, daemon=True).start()
+
+
+────────────────────────────────────────────────────────────────────────────
+4.  NICK CHANGE TRACKER
+    File: 04_nickwatch.py
+────────────────────────────────────────────────────────────────────────────
+
+Keeps a log of every nick change in the session so you can remember who was
+who.  Writes to a dedicated "nicklog" buffer.
+
+    from scroll.script import on, echo
+    import time
+
+    @on("nick")
+    def track_nick(e):
+        ts = time.strftime("%H:%M:%S")
+        echo("nicklog", "[%s] %s is now known as %s"
+             % (ts, e.old_nick, e.new_nick))
+
+
+────────────────────────────────────────────────────────────────────────────
+5.  CHANNEL LOGGER
+    File: 05_logger.py
+────────────────────────────────────────────────────────────────────────────
+
+Appends every channel message to a log file.  Useful for keeping a record of
+important channels even when you scroll away.
+
+    import os, time
+    from scroll.script import on
+
+    LOG_DIR = os.path.expanduser("~/.scroll/logs/")
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    def _log(channel, line):
+        fname = os.path.join(LOG_DIR, channel.lstrip("#") + ".log")
+        with open(fname, "a") as f:
+            f.write(line + "\n")
+
+    @on("privmsg")
+    def log_msg(e):
+        if e.target.startswith("#"):
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            _log(e.target, "[%s] <%s> %s" % (ts, e.nick, e.text))
+
+    @on("action")
+    def log_action(e):
+        if e.target.startswith("#"):
+            ts = time.strftime("%Y-%m-%d %H:%M:%S")
+            _log(e.target, "[%s] * %s %s" % (ts, e.nick, e.text))
+
+    @on("join")
+    def log_join(e):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        _log(e.channel, "[%s] --> %s joined" % (ts, e.nick))
+
+    @on("part")
+    def log_part(e):
+        ts = time.strftime("%Y-%m-%d %H:%M:%S")
+        _log(e.channel, "[%s] <-- %s left (%s)" % (ts, e.nick, e.reason))
+
+Log files land in ~/.scroll/logs/.  Rotate them however you like — cron,
+logrotate, or a second script that watches them.
+
+
+────────────────────────────────────────────────────────────────────────────
+6.  SEEN COMMAND  (/seen <nick>)
+    File: 06_seen.py
+────────────────────────────────────────────────────────────────────────────
+
+Tracks the last time any nick was seen speaking in a channel and answers
+/seen queries.
+
+    import time
+    from scroll.script import on, irc, echo
+
+    _seen = {}   # nick (lowercase) → (channel, timestamp, text)
+
+    @on("privmsg")
+    def record_seen(e):
+        if e.target.startswith("#"):
+            _seen[e.nick.lower()] = (e.target, time.time(), e.text)
+
+    @on("command:seen")
+    def cmd_seen(args):
+        """/seen <nick> — when was this nick last seen speaking?"""
+        nick = args.strip().lower()
+        if not nick:
+            echo("server", "Usage: /seen <nick>")
+            return
+        if nick == irc.nick.lower():
+            echo("server", "That's you.")
+            return
+        if nick not in _seen:
+            echo("server", "I have not seen %s." % nick)
+            return
+        channel, ts, text = _seen[nick]
+        when = time.strftime("%H:%M:%S", time.localtime(ts))
+        echo("server", "%s was last seen in %s at %s saying: %s"
+             % (nick, channel, when, text))
+
+This is only in-memory — restarts wipe the history.  Persist _seen to a JSON
+file with json.dump/json.load if you want it to survive reconnects.
+
+
+────────────────────────────────────────────────────────────────────────────
+7.  TIMED REMINDERS  (/remind <seconds> <message>)
+    File: 07_remind.py
+────────────────────────────────────────────────────────────────────────────
+
+Set a personal reminder that fires after N seconds.  The message appears in
+your server buffer.
+
+    import threading
+    from scroll.script import on, irc, echo
+
+    @on("command:remind")
+    def cmd_remind(args):
+        """/remind <seconds> <message> — remind yourself after a delay."""
+        parts = args.strip().split(" ", 1)
+        if len(parts) < 2:
+            echo("server", "Usage: /remind <seconds> <message>")
+            return
+        try:
+            delay = int(parts[0])
+        except ValueError:
+            echo("server", "remind: first argument must be a number of seconds")
+            return
+        msg = parts[1]
+
+        def _fire():
+            threading.Event().wait(delay)
+            echo("server", "REMINDER: %s" % msg)
+            print("\a", end="", flush=True)
+
+        threading.Thread(target=_fire, daemon=True).start()
+        echo("server", "-- reminder set for %ds: %s" % (delay, msg))
+
+Usage: /remind 300 check the build
+
+
+────────────────────────────────────────────────────────────────────────────
+8.  PERIODIC STATUS PINGS
+    File: 08_heartbeat.py
+────────────────────────────────────────────────────────────────────────────
+
+Uses a background thread to fire a callback every N seconds.  This is the
+scroll equivalent of irssi's timer system.
+
+    import threading, time
+    from scroll.script import on, irc, echo
+
+    def every(seconds, func):
+        """Run func in a daemon thread every `seconds` seconds."""
+        def _loop():
+            while True:
+                time.sleep(seconds)
+                try:
+                    func()
+                except Exception as exc:
+                    echo("server", "timer error: %s" % exc)
+        threading.Thread(target=_loop, daemon=True).start()
+
+    @on("connect")
+    def start_timers(e):
+        def lagcheck():
+            if irc.connected:
+                irc.raw("PING :lagcheck")
+        every(60, lagcheck)
+        echo("server", "-- heartbeat started (PING every 60s)")
+
+
+────────────────────────────────────────────────────────────────────────────
+9.  WIKIPEDIA LOOKUP  (/wiki <search term>)
+    File: 09_wiki.py
+────────────────────────────────────────────────────────────────────────────
+
+Fetches the first paragraph of a Wikipedia article and prints it to your
+current buffer.  Uses only the standard library.
+
+    import threading, urllib.request, urllib.parse, json
+    from scroll.script import on, irc, echo
+
+    def _fetch_wiki(query, target):
+        params = urllib.parse.urlencode({
+            "action":   "query",
+            "list":     "search",
+            "srsearch": query,
+            "format":   "json",
+            "srlimit":  "1",
+        })
+        url = "https://en.wikipedia.org/w/api.php?" + params
+        try:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                data = json.loads(r.read())
+            results = data.get("query", {}).get("search", [])
+            if not results:
+                echo(target, "wiki: no results for '%s'" % query)
+                return
+            title = results[0]["title"]
+
+            # Now fetch the extract for that title
+            params2 = urllib.parse.urlencode({
+                "action":    "query",
+                "prop":      "extracts",
+                "exintro":   "",
+                "explaintext": "",
+                "titles":    title,
+                "format":    "json",
+            })
+            url2 = "https://en.wikipedia.org/w/api.php?" + params2
+            with urllib.request.urlopen(url2, timeout=8) as r:
+                data2 = json.loads(r.read())
+            pages = data2["query"]["pages"]
+            page  = next(iter(pages.values()))
+            extract = page.get("extract", "").strip()
+            # First non-empty paragraph only
+            paragraph = next(
+                (p.strip() for p in extract.split("\n\n") if p.strip()), ""
+            )
+            if not paragraph:
+                echo(target, "wiki: no extract for '%s'" % title)
+                return
+            # Wrap to ~400 chars
+            echo(target, "[ Wikipedia: %s ]" % title)
+            for i in range(0, min(len(paragraph), 400), 80):
+                echo(target, "  " + paragraph[i:i+80])
+            echo(target, "  https://en.wikipedia.org/wiki/%s"
+                 % urllib.parse.quote(title.replace(" ", "_")))
+        except Exception as exc:
+            echo(target, "wiki: error — %s" % exc)
+
+    @on("command:wiki")
+    def cmd_wiki(args):
+        """/wiki <query> — look up a term on Wikipedia."""
+        query = args.strip()
+        if not query:
+            echo("server", "Usage: /wiki <query>")
+            return
+        target = irc.current_channel or "server"
+        echo(target, "-- searching Wikipedia for '%s'..." % query)
+        threading.Thread(target=_fetch_wiki, args=(query, target),
+                         daemon=True).start()
+
+/wiki bsd unix  →  prints a paragraph to your current channel buffer.
+
+To send the result to the channel instead of just your screen, change
+echo(target, ...) to irc.privmsg(target, ...).  Be considerate.
+
+
+────────────────────────────────────────────────────────────────────────────
+10. DUCKDUCKGO INSTANT ANSWERS  (/ddg <query>)
+    File: 10_ddg.py
+────────────────────────────────────────────────────────────────────────────
+
+DuckDuckGo exposes a free, no-auth Instant Answer API that returns plain
+text summaries for many queries.  No API key required.
+
+    import threading, urllib.request, urllib.parse, json
+    from scroll.script import on, irc, echo
+
+    def _fetch_ddg(query, target):
+        params = urllib.parse.urlencode({
+            "q":              query,
+            "format":         "json",
+            "no_html":        "1",
+            "skip_disambig":  "1",
+        })
+        url = "https://api.duckduckgo.com/?" + params
+        try:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                data = json.loads(r.read())
+            answer = (
+                data.get("AbstractText") or
+                data.get("Answer") or
+                data.get("Definition") or
+                ""
+            ).strip()
+            source = data.get("AbstractSource", "")
+            if not answer:
+                echo(target, "ddg: no instant answer for '%s'" % query)
+                return
+            echo(target, "[ DDG%s ]" % (": " + source if source else ""))
+            for i in range(0, min(len(answer), 400), 80):
+                echo(target, "  " + answer[i:i+80])
+        except Exception as exc:
+            echo(target, "ddg: error — %s" % exc)
+
+    @on("command:ddg")
+    def cmd_ddg(args):
+        """/ddg <query> — DuckDuckGo instant answer."""
+        query = args.strip()
+        if not query:
+            echo("server", "Usage: /ddg <query>")
+            return
+        target = irc.current_channel or "server"
+        echo(target, "-- asking DuckDuckGo: '%s'..." % query)
+        threading.Thread(target=_fetch_ddg, args=(query, target),
+                         daemon=True).start()
+
+Try: /ddg speed of light
+     /ddg python language
+     /ddg linus torvalds
+
+
+────────────────────────────────────────────────────────────────────────────
+11. WEATHER  (/weather <city>)
+    File: 11_weather.py
+────────────────────────────────────────────────────────────────────────────
+
+wttr.in is a fantastic weather service with a terminal-friendly API.  Ask
+it for a one-line summary and display it right in your buffer.
+
+    import threading, urllib.request, urllib.parse
+    from scroll.script import on, irc, echo
+
+    def _fetch_weather(city, target):
+        encoded = urllib.parse.quote(city)
+        url = "https://wttr.in/%s?format=3" % encoded   # "City: ⛅ +18°C"
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                line = r.read().decode("utf-8", errors="replace").strip()
+            echo(target, line)
+        except Exception as exc:
+            echo(target, "weather: error — %s" % exc)
+
+    @on("command:weather")
+    def cmd_weather(args):
+        """/weather <city> — current conditions from wttr.in."""
+        city = args.strip()
+        if not city:
+            echo("server", "Usage: /weather <city>")
+            return
+        target = irc.current_channel or "server"
+        threading.Thread(target=_fetch_weather, args=(city, target),
+                         daemon=True).start()
+
+/weather Tokyo  →  Tokyo: ⛅ +22°C
+
+Change format=3 to format=1 for a more detailed three-line forecast block.
+
+
+────────────────────────────────────────────────────────────────────────────
+12. URL TITLE FETCHER
+    File: 12_urltitle.py
+────────────────────────────────────────────────────────────────────────────
+
+Whenever someone posts an http/https URL in a channel, fetch its <title>
+and echo it back so everyone knows what they are clicking on.
+
+    import re, threading, urllib.request, html
+    from scroll.script import on, echo
+
+    _URL_RE = re.compile(r'https?://[^\s>"\')]+')
+
+    def _fetch_title(url, target):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={"User-Agent": "Mozilla/5.0 (scroll IRC)"},
+            )
+            with urllib.request.urlopen(req, timeout=6) as r:
+                # Only read enough to find the title — avoid downloading huge pages
+                chunk = r.read(8192).decode("utf-8", errors="replace")
+            m = re.search(r'<title[^>]*>([^<]+)</title>', chunk, re.IGNORECASE)
+            if m:
+                title = html.unescape(m.group(1).strip())
+                echo(target, "[ %s ]" % title)
+        except Exception:
+            pass   # silently ignore broken links
+
+    @on("privmsg")
+    def on_url(e):
+        if not e.target.startswith("#"):
+            return
+        for url in _URL_RE.findall(e.text):
+            threading.Thread(target=_fetch_title, args=(url, e.target),
+                             daemon=True).start()
+
+
+────────────────────────────────────────────────────────────────────────────
+13. ROT13  (/rot13 <text>)
+    File: 13_rot13.py
+────────────────────────────────────────────────────────────────────────────
+
+The traditional Usenet spoiler cipher.  Also a nice demo that /slash
+commands can return output without touching IRC.
+
+    from scroll.script import on, irc, echo
+    import codecs
+
+    @on("command:rot13")
+    def cmd_rot13(args):
+        """/rot13 <text> — encode or decode ROT13 locally."""
+        if not args.strip():
+            echo("server", "Usage: /rot13 <text>")
+            return
+        result = codecs.encode(args, "rot_13")
+        target = irc.current_channel or "server"
+        echo(target, "rot13: %s" % result)
+
+    @on("command:say13")
+    def cmd_say13(args):
+        """/say13 <text> — send ROT13-encoded text to the current channel."""
+        import codecs
+        if not args.strip():
+            echo("server", "Usage: /say13 <text>")
+            return
+        if not irc.current_channel:
+            echo("server", "say13: not in a channel")
+            return
+        irc.privmsg(irc.current_channel, codecs.encode(args, "rot_13"))
+
+
+────────────────────────────────────────────────────────────────────────────
+14. FORTUNE ON CONNECT
+    File: 14_fortune.py
+────────────────────────────────────────────────────────────────────────────
+
+Print a fortune cookie to the server buffer each time you connect.  Requires
+the fortune(6) command to be installed.
+
+    import subprocess
+    from scroll.script import on, echo
+
+    @on("connect")
+    def fortune_on_connect(e):
+        try:
+            result = subprocess.run(["fortune"], capture_output=True,
+                                    text=True, timeout=3)
+            for line in result.stdout.strip().splitlines():
+                echo("server", line)
+        except FileNotFoundError:
+            pass   # fortune not installed, silently skip
+        except Exception as exc:
+            echo("server", "fortune: %s" % exc)
+
+
+────────────────────────────────────────────────────────────────────────────
+15. COMBINING EVERYTHING: A TRIVIA BOT
+    File: 15_trivia.py
+────────────────────────────────────────────────────────────────────────────
+
+Uses the Open Trivia Database (opentdb.com, free, no auth) to run a trivia
+game in a channel.  /trivia starts a round.  First correct answer wins.
+
+    import threading, urllib.request, urllib.parse, json, html, random
+    from scroll.script import on, irc, echo
+
+    _question  = None   # current question text
+    _answer    = None   # correct answer (lowercase)
+    _channel   = None   # channel the round is running in
+
+    def _fetch_question(target):
+        global _question, _answer, _channel
+        url = "https://opentdb.com/api.php?amount=1&type=multiple"
+        try:
+            with urllib.request.urlopen(url, timeout=8) as r:
+                data = json.loads(r.read())
+            result   = data["results"][0]
+            question = html.unescape(result["question"])
+            correct  = html.unescape(result["correct_answer"])
+            wrong    = [html.unescape(a) for a in result["incorrect_answers"]]
+            choices  = wrong + [correct]
+            random.shuffle(choices)
+
+            _question = question
+            _answer   = correct.lower()
+            _channel  = target
+
+            irc.privmsg(target, "TRIVIA: %s" % question)
+            irc.privmsg(target, "Choices: %s" % " | ".join(choices))
+            irc.privmsg(target, "(30 seconds to answer)")
+
+            def timeout():
+                global _question, _answer, _channel
+                if _question:
+                    irc.privmsg(_channel,
+                                "Time's up!  The answer was: %s" % correct)
+                    _question = _answer = _channel = None
+            threading.Timer(30, timeout).start()
+        except Exception as exc:
+            echo(target, "trivia: error — %s" % exc)
+
+    @on("command:trivia")
+    def cmd_trivia(args):
+        """/trivia — start a trivia question in the current channel."""
+        if not irc.current_channel:
+            echo("server", "trivia: join a channel first")
+            return
+        if _question:
+            irc.privmsg(irc.current_channel,
+                        "A round is already in progress!")
+            return
+        threading.Thread(
+            target=_fetch_question,
+            args=(irc.current_channel,),
+            daemon=True,
+        ).start()
+
+    @on("privmsg")
+    def check_answer(e):
+        global _question, _answer, _channel
+        if not _question:
+            return
+        if e.target != _channel:
+            return
+        if e.text.strip().lower() == _answer:
+            irc.privmsg(_channel,
+                        "Correct, %s!  The answer was: %s" % (e.nick, _answer))
+            _question = _answer = _channel = None
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+TIPS AND PATTERNS
+-----------------
+
+State between events
+    Use module-level variables.  They persist for the lifetime of the process.
+    A /reload wipes them, so initialise defensively (use .setdefault, etc.).
+
+Background work
+    Never block in an event handler.  IRC events arrive on the main thread.
+    If you need to do network I/O, disk I/O, or any slow work, use
+    threading.Thread(..., daemon=True).start() as shown in the examples above.
+
+Sending to IRC vs. echoing locally
+    irc.privmsg()  →  the channel sees it.  Use sparingly.
+    echo()         →  only you see it.  Prefer this for status/debug output.
+
+Targeting your output
+    e.target is the channel in a channel message, or your nick in a PM.
+    irc.current_channel is what is on screen right now.
+    Use "server" as a fallback when no channel is active.
+
+Re-entrant handlers
+    Two events can arrive close together.  If your handler modifies shared
+    state, use threading.Lock() to protect it.
+
+Error handling
+    Any exception that escapes a handler is caught by scroll and printed to
+    the server buffer.  That is your stack trace.  You do not need to wrap
+    every handler in try/except unless you want custom error messages.
+
+Reloading
+    /reload re-executes all script files and clears all previously registered
+    handlers and commands.  Module-level code (imports, globals) runs again.
+    Event handler functions registered with @on() are re-registered fresh.
+
+Ordering
+    Files are loaded in sorted filename order.  Prefix with numbers
+    (01_highlight.py, 02_greet.py) to control load order if scripts depend
+    on each other.
+
+The standard library is your toolbox
+    urllib.request, json, subprocess, threading, re, time, os, socket — it
+    is all there, no pip install needed.  The examples above use nothing
+    outside the standard library except the scroll.script module itself.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+QUICK REFERENCE
+---------------
+
+    from scroll.script import on, irc, tui, echo
+
+    # Event handler
+    @on("privmsg")
+    def handler(e): ...           # e.nick, e.target, e.text, e.raw
+
+    # Slash command
+    @on("command:name")
+    def cmd(args): ...            # args is a plain string
+
+    # IRC actions
+    irc.privmsg(target, text)
+    irc.notice(target, text)
+    irc.join(channel)
+    irc.part(channel, reason)
+    irc.raw(line)
+    irc.nick                      # your current nick
+    irc.current_channel           # active channel or ""
+    irc.connected                 # bool
+
+    # UI
+    echo(target, text)            # local-only output to named buffer
+    tui.server_msg(text)          # shortcut: echo to server buffer
+    tui.current_buffer()          # Buffer object
+    tui.get_or_add_buffer(name)   # find or create buffer
+    tui.switch_to(index)          # switch visible buffer
+
+    # Reload
+    /reload                       # re-executes all script files

@@ -3,6 +3,7 @@
 scroll — a minimal irssi-inspired IRC client.
 Entry point: parses config.hcl, connects, runs the TUI.
 """
+import importlib
 import os
 import re
 import signal
@@ -56,6 +57,26 @@ def parse_hcl(text):
     return cfg
 
 
+def load_scripts(scripts_dir, tui):
+    """Exec every .py file in scripts_dir, in sorted order."""
+    if not scripts_dir:
+        return
+    scripts_dir = os.path.expanduser(scripts_dir)
+    if not os.path.isdir(scripts_dir):
+        return
+    for fname in sorted(os.listdir(scripts_dir)):
+        if not fname.endswith(".py"):
+            continue
+        path = os.path.join(scripts_dir, fname)
+        try:
+            with open(path) as f:
+                code = f.read()
+            ns = {"__file__": path, "__name__": fname[:-3]}
+            exec(compile(code, path, "exec"), ns)
+        except Exception as exc:
+            tui.server_msg("Script load error (%s): %s" % (fname, exc))
+
+
 def load_config():
     # Look for config.hcl next to the package, then in ~/.config/scroll/
     candidates = [
@@ -72,7 +93,7 @@ def load_config():
 
 # ── Command definitions ───────────────────────────────────────────────────────
 
-def register_commands(tui, irc):
+def register_commands(tui, irc, cfg):
 
     def cmd_join(args):
         """Join a channel.  Usage: /join #channel"""
@@ -247,6 +268,98 @@ With -o: send output to the current channel (>2 lines prompts for stagger)."""
                 no_cb=lambda: tui.server_msg("exec: cancelled"),
             )
 
+    def cmd_script(args):
+        """/script [edit <file.py>] — list scripts with checksums, or open one in $EDITOR."""
+        import hashlib, _curses
+
+        scripts_dir = cfg.get("scripts_directory", "")
+        if not scripts_dir:
+            tui.server_msg("script: scripts_directory not set in config.hcl")
+            return
+        scripts_dir = os.path.expanduser(scripts_dir)
+        if not os.path.isdir(scripts_dir):
+            tui.server_msg("script: directory not found: %s" % scripts_dir)
+            return
+
+        argv = args.strip().split(None, 1)
+        subcmd = argv[0].lower() if argv else ""
+
+        # ── /script edit <file.py> ────────────────────────────────────────────
+        if subcmd == "edit":
+            if len(argv) < 2:
+                tui.server_msg("Usage: /script edit <file.py>")
+                return
+            fname = argv[1].strip()
+            if os.sep in fname or fname.startswith(".."):
+                tui.server_msg("script: invalid filename")
+                return
+            if not fname.endswith(".py"):
+                fname += ".py"
+            fpath = os.path.join(scripts_dir, fname)
+            editor = os.environ.get("EDITOR") or os.environ.get("VISUAL")
+            if not editor:
+                tui.server_msg("script: $EDITOR is not set")
+                return
+            win = tui._window
+            if not win or not win.window:
+                tui.server_msg("script: window not ready")
+                return
+            # Suspend curses, hand the terminal to the editor, then resume.
+            _curses.endwin()
+            try:
+                subprocess.run([editor, fpath])
+            finally:
+                win.window.refresh()
+                win.window.clear()
+            tui.server_msg("script: returned from editor (%s)" % fname)
+            return
+
+        # ── /script (no args) — list with sha1sums ────────────────────────────
+        try:
+            files = sorted(f for f in os.listdir(scripts_dir) if f.endswith(".py"))
+        except OSError as e:
+            tui.server_msg("script: %s" % e)
+            return
+
+        if not files:
+            tui.server_msg("script: no scripts in %s" % scripts_dir)
+            return
+
+        col_w = max(len(f) for f in files)
+        tui.server_msg("scripts in %s" % scripts_dir)
+        tui.server_msg("  %-*s  sha1" % (col_w, "file"))
+        tui.server_msg("  %s  %s" % ("-" * col_w, "-" * 40))
+        for fname in files:
+            fpath = os.path.join(scripts_dir, fname)
+            try:
+                with open(fpath, "rb") as f:
+                    digest = hashlib.sha1(f.read()).hexdigest()
+            except OSError:
+                digest = "(unreadable)"
+            tui.server_msg("  %-*s  %s" % (col_w, fname, digest))
+
+    def cmd_reload(args):
+        """Reload all scripts from scripts_directory.  Usage: /reload"""
+        from . import script as _script
+        _script._clear()
+        load_scripts(cfg.get("scripts_directory"), tui)
+        tui.server_msg("Scripts reloaded.")
+
+    def cmd_doc(args):
+        """Open a documentation buffer.  Usage: /doc [topic]"""
+        from .docs import list_docs, load_doc
+        topic = args.strip().lower()
+        if not topic:
+            available = list_docs()
+            tui.server_msg("Available docs: %s  (use /doc <topic>)" % ", ".join(available))
+            return
+        text = load_doc(topic)
+        if text is None:
+            available = list_docs()
+            tui.server_msg("No doc '%s'.  Available: %s" % (topic, ", ".join(available)))
+            return
+        tui.open_doc(topic, text)
+
     def cmd_help(args):
         """Show available commands and their descriptions.  Usage: /help [command]"""
         args = args.strip().lower().lstrip("/")
@@ -275,8 +388,11 @@ With -o: send output to the current channel (>2 lines prompts for stagger)."""
         ("names",  cmd_names),
         ("clear",  cmd_clear),
         ("server", cmd_server),
+        ("doc",    cmd_doc),
         ("wc",     cmd_wc),
         ("exec",   cmd_exec),
+        ("script", cmd_script),
+        ("reload", cmd_reload),
         ("help",   cmd_help),
     ]:
         tui.register_command(name, func)
@@ -405,7 +521,11 @@ def main():
     tui.irc = irc
     irc.handlers.append(tui.handle_irc)
 
-    register_commands(tui, irc)
+    register_commands(tui, irc, cfg)
+
+    from . import script as _script
+    _script._setup(irc, tui)
+    load_scripts(cfg.get("scripts_directory"), tui)
 
     # Update the server buffer name
     tui.buffers[0].name = name

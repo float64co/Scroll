@@ -62,32 +62,45 @@ class Buffer:
     """Holds lines for one IRC context (server or channel/query)."""
 
     def __init__(self, name):
-        self.name   = name          # e.g. "irc.rizon.net" or "#anime"
-        self.lines  = []            # list of (timestamp_str, nick, text, attrs)
-        self.nicks  = []            # list of nick strings (channels only)
-        self.topic  = ""
-        self.unread = False
+        self.name       = name      # e.g. "irc.rizon.net" or "#anime"
+        self.lines      = []        # list of (timestamp_str, nick, text, attrs)
+        self.nicks      = []        # list of nick strings (channels only)
+        self.topic      = ""
+        self.unread     = False
+        self.kind       = "chat"    # "chat" | "doc"
+        self.scroll_pos = 0         # first visible line (doc buffers only)
 
     def add(self, ts, nick, text, attrs=0):
         self.lines.append((ts, nick, text, attrs))
         self.unread = True
 
-    def render_lines(self, width, height):
-        """
-        Return a list of display strings (already formatted, truncated)
-        for the last *height* visible rows.
-        """
+    def _render_all(self, width):
+        """Return every display line after hard-wrapping."""
         rendered = []
         for (ts, nick, text, _attrs) in self.lines:
-            if nick:
+            if ts is None:
+                line = text
+            elif nick:
                 line = "%s <%s> %s" % (ts, nick, text)
             else:
                 line = "%s  %s" % (ts, text)
-            # hard-wrap long lines
             while display_width(line) > width > 0:
                 rendered.append(line[:width])
                 line = "    " + line[width:]
             rendered.append(line)
+        return rendered
+
+    def render_lines(self, width, height):
+        """
+        Return display lines for the visible area.
+        Doc buffers slice from scroll_pos; chat buffers pin to the bottom.
+        Pass ts=None when adding a line to suppress the timestamp prefix.
+        """
+        rendered = self._render_all(width)
+        if self.kind == "doc":
+            start = max(0, min(self.scroll_pos, max(0, len(rendered) - height)))
+            self.scroll_pos = start          # clamp in place
+            return rendered[start:start + height] if height > 0 else rendered[start:]
         return rendered[-height:] if height > 0 else rendered
 
 
@@ -112,17 +125,44 @@ class TopicPane(Pane):
 class MessagePane(Pane):
     geometry = [EXPAND, EXPAND]
 
-    def __init__(self, buf_ref):
+    def __init__(self, buf_ref, tui_ref):
         super().__init__("messages")
-        self._buf = buf_ref   # callable returning current Buffer
+        self._buf = buf_ref
+        self._tui = tui_ref
 
     def update(self):
         buf = self._buf()
         if buf is None or self.height is None or self.width is None:
             return
         lines = buf.render_lines(self.width, self.height)
-        text  = "\n".join(lines)
-        self.content = [[text, ALIGN_LEFT, 0]]
+        self.content = [["\n".join(lines), ALIGN_LEFT, 0]]
+
+    def process_input(self, character):
+        if self._tui._focus != "input":
+            return
+        buf = self._buf()
+        if buf is None or buf.kind != "doc":
+            return
+        h       = self.height or 24
+        w       = self.width  or 80
+        total   = len(buf._render_all(w))
+        max_pos = max(0, total - h)
+
+        if character == 259:    # Up
+            buf.scroll_pos = max(0, buf.scroll_pos - 1)
+        elif character == 258:  # Down
+            buf.scroll_pos = min(max_pos, buf.scroll_pos + 1)
+        elif character == 339:  # PgUp
+            buf.scroll_pos = max(0, buf.scroll_pos - h)
+        elif character == 338:  # PgDn
+            buf.scroll_pos = min(max_pos, buf.scroll_pos + h)
+        elif character == 262:  # Home
+            buf.scroll_pos = 0
+        elif character == 360:  # End
+            buf.scroll_pos = max_pos
+        else:
+            return
+        self.window.window.clear()
 
 
 class SepPane(Pane):
@@ -532,6 +572,16 @@ class ScrollTUI:
         if buf is not self.current_buffer():
             buf.unread = True
 
+    # ── script event firing ───────────────────────────────────────────────────
+
+    def _fire(self, event, **kwargs):
+        """Fire a scripting event.  Failures are silently swallowed."""
+        try:
+            from . import script as _script
+            _script.fire(event, **kwargs)
+        except Exception:
+            pass
+
     # ── IRC event dispatch ───────────────────────────────────────────────────
 
     def handle_irc(self, msg):
@@ -540,12 +590,14 @@ class ScrollTUI:
         prefix   = msg["prefix"]
         params   = msg["params"]
         trailing = msg["trailing"]
+        raw      = msg.get("raw", "")
         nick     = prefix.split("!")[0] if "!" in prefix else prefix
 
         if cmd in ("001", "002", "003", "004", "372", "375", "376",
                    "251", "252", "253", "254", "255"):
-            # Welcome / MOTD lines → server buffer
             self.server_msg(trailing or " ".join(params))
+            if cmd == "001":
+                self._fire("connect")
 
         elif cmd == "NOTICE":
             target = params[0] if params else ""
@@ -553,27 +605,29 @@ class ScrollTUI:
                 self.channel_msg(target, "-" + nick + "-", trailing)
             else:
                 self.server_msg("-%s- %s" % (nick, trailing))
+            self._fire("notice", nick=nick, target=target, text=trailing, raw=raw)
 
         elif cmd == "JOIN":
             channel = trailing or (params[0] if params else "")
             buf = self.get_or_add_buffer(channel)
             buf.add(timestamp(), "", "* %s has joined %s" % (nick, channel))
             if nick == (self.irc.nick if self.irc else ""):
-                # Switch to joined channel
-                idx = self.buffers.index(buf)
-                self.switch_to(idx)
+                self.switch_to(self.buffers.index(buf))
+            self._fire("join", nick=nick, channel=channel, raw=raw)
 
         elif cmd == "PART":
             channel = params[0] if params else ""
             buf = self.get_buffer(channel)
             if buf:
                 buf.add(timestamp(), "", "* %s has left %s (%s)" % (nick, channel, trailing))
+            self._fire("part", nick=nick, channel=channel, reason=trailing, raw=raw)
 
         elif cmd == "QUIT":
             for buf in self.buffers:
                 if nick in buf.nicks:
                     buf.nicks.remove(nick)
                     buf.add(timestamp(), "", "* %s has quit (%s)" % (nick, trailing))
+            self._fire("quit", nick=nick, reason=trailing, raw=raw)
 
         elif cmd == "PRIVMSG":
             target = params[0] if params else ""
@@ -590,6 +644,7 @@ class ScrollTUI:
                         self.channel_msg(target, "", line)
                     else:
                         self.channel_msg(nick, "", line)
+                    self._fire("action", nick=nick, target=target, text=ctcp_arg, raw=raw)
 
                 elif ctcp_cmd == "VERSION":
                     self.irc.notice(nick, "\x01VERSION scroll\x01")
@@ -604,9 +659,10 @@ class ScrollTUI:
 
             elif target.startswith("#"):
                 self.channel_msg(target, nick, text)
+                self._fire("privmsg", nick=nick, target=target, text=text, raw=raw)
             else:
-                # PM — open a query buffer
                 self.channel_msg(nick, nick, text)
+                self._fire("privmsg", nick=nick, target=nick, text=text, raw=raw)
 
         elif cmd == "353":  # RPL_NAMREPLY
             channel = params[2] if len(params) > 2 else ""
@@ -628,6 +684,7 @@ class ScrollTUI:
             buf = self.get_or_add_buffer(channel)
             buf.topic = trailing
             buf.add(timestamp(), "", "* %s changed topic to: %s" % (nick, trailing))
+            self._fire("topic", nick=nick, channel=channel, text=trailing, raw=raw)
 
         elif cmd == "KICK":
             channel = params[0] if params else ""
@@ -638,12 +695,14 @@ class ScrollTUI:
                     kicked, channel, nick, trailing))
                 if kicked == (self.irc.nick if self.irc else ""):
                     buf.nicks = []
+            self._fire("kick", nick=nick, channel=channel, kicked=kicked, reason=trailing, raw=raw)
 
         elif cmd == "NICK":
             new_nick = trailing or (params[0] if params else "")
             for buf in self.buffers:
                 if nick in [n.lstrip("@+%&~!") for n in buf.nicks]:
                     buf.add(timestamp(), "", "* %s is now known as %s" % (nick, new_nick))
+            self._fire("nick", old_nick=nick, new_nick=new_nick, raw=raw)
 
         elif cmd == "MODE":
             target = params[0] if params else ""
@@ -651,6 +710,7 @@ class ScrollTUI:
             extra  = " ".join(params[2:])
             buf = self.get_buffer(target) or self.buffers[0]
             buf.add(timestamp(), "", "* Mode %s [%s %s] by %s" % (target, mode, extra, nick))
+            self._fire("mode", nick=nick, target=target, mode=mode + " " + extra, raw=raw)
 
         elif cmd == "433":  # ERR_NICKNAMEINUSE
             self.server_msg("* Nickname in use, trying with _")
@@ -662,8 +722,6 @@ class ScrollTUI:
             self.server_msg("ERROR: %s" % trailing)
 
         else:
-            # Generic: dump to server buffer
-            raw = msg.get("raw", "")
             if raw:
                 self.server_msg(raw)
 
@@ -718,6 +776,17 @@ class ScrollTUI:
 
     # ── window construction & run ────────────────────────────────────────────
 
+    def open_doc(self, name, text):
+        """Open or switch to a documentation buffer populated with *text*."""
+        buf_name = "[%s]" % name
+        buf = self.get_buffer(buf_name)
+        if buf is None:
+            buf = self._add_buffer(buf_name)
+            buf.kind = "doc"
+            for line in text.splitlines():
+                buf.add(None, "", line)
+        self.switch_to(self.buffers.index(buf))
+
     def remove_buffer(self, buf):
         """Remove a buffer and switch to the nearest remaining one."""
         if buf not in self.buffers:
@@ -759,7 +828,7 @@ class ScrollTUI:
         win.delay = 0.05
 
         topic_pane  = TopicPane()
-        msg_pane    = MessagePane(self.current_buffer)
+        msg_pane    = MessagePane(self.current_buffer, self)
         sep_pane    = SepPane()
         nick_pane   = NickPane(self.current_buffer, self)
         status_pane = StatusPane(lambda: self)
