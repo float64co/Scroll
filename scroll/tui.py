@@ -416,6 +416,9 @@ class InputPane(Pane):
         self._buf       = buf_ref
         self._tui       = tui_ref
         self._tab_state = None   # completion state while cycling
+        self._history   = []     # submitted lines, oldest first
+        self._hist_pos  = -1     # -1 = not browsing history
+        self._hist_draft = ""    # saved current input while browsing
 
     def update(self):
         attrs  = 0
@@ -444,21 +447,47 @@ class InputPane(Pane):
             line = self.buffer
             self.buffer = ""
             self.cursor = 0
+            self._hist_pos  = -1
+            self._hist_draft = ""
             if self._on_submit and line.strip():
+                if not self._history or self._history[-1] != line:
+                    self._history.append(line)
                 self._on_submit(line)
             self.window.window.clear()
+        elif character == 259:              # Up — older history
+            if self._history:
+                if self._hist_pos == -1:
+                    self._hist_draft = self.buffer
+                    self._hist_pos = len(self._history) - 1
+                elif self._hist_pos > 0:
+                    self._hist_pos -= 1
+                self.buffer = self._history[self._hist_pos]
+                self.window.window.clear()
+        elif character == 258:              # Down — newer history
+            if self._hist_pos != -1:
+                if self._hist_pos < len(self._history) - 1:
+                    self._hist_pos += 1
+                    self.buffer = self._history[self._hist_pos]
+                else:
+                    self._hist_pos = -1
+                    self.buffer = self._hist_draft
+                self.window.window.clear()
         elif character in (263, 127, 8):    # Backspace
             if self.buffer:
                 self.buffer = self.buffer[:-1]
+                self._hist_pos = -1
                 self.window.window.clear()
         elif character == 23:               # Ctrl+W — kill word
             parts = self.buffer.rstrip().rsplit(" ", 1)
             self.buffer = parts[0] + " " if len(parts) > 1 else ""
+            self._hist_pos = -1
         elif character == 21:               # Ctrl+U — kill line
             self.buffer = ""
+            self._hist_pos = -1
         elif 32 <= character < 127 or 160 <= character < 256:
             try:
                 self.buffer += chr(character)
+                self._hist_pos = -1
             except Exception:
                 pass
 
