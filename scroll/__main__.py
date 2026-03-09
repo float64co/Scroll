@@ -67,17 +67,23 @@ def load_scripts(scripts_dir, tui):
     scripts_dir = os.path.expanduser(scripts_dir)
     if not os.path.isdir(scripts_dir):
         return
+    import hashlib
+    from . import script as _script
     for fname in sorted(os.listdir(scripts_dir)):
         if not fname.endswith(".py"):
             continue
         path = os.path.join(scripts_dir, fname)
         try:
-            with open(path) as f:
-                code = f.read()
+            with open(path, "rb") as f:
+                data = f.read()
+            sha1 = hashlib.sha1(data).hexdigest()
+            _script._begin_load(fname, sha1)
             ns = {"__file__": path, "__name__": fname[:-3]}
-            exec(compile(code, path, "exec"), ns)
+            exec(compile(data.decode(), path, "exec"), ns)
         except Exception as exc:
             tui.server_msg("Script load error (%s): %s" % (fname, exc))
+        finally:
+            _script._end_load()
 
 
 def load_config():
@@ -431,7 +437,21 @@ With -o: send output to the current channel (>2 lines prompts for stagger)."""
             finally:
                 win.window.refresh()
                 win.window.clear()
-            tui.server_msg("script: returned from editor (%s)" % fname)
+            # Reload exclusively the edited script
+            from . import script as _script
+            _script._clear_script(fname)
+            try:
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                sha1 = hashlib.sha1(data).hexdigest()
+                _script._begin_load(fname, sha1)
+                ns = {"__file__": fpath, "__name__": fname[:-3]}
+                exec(compile(data.decode(), fpath, "exec"), ns)
+                tui.server_msg("Finished editing %s." % fname)
+            except Exception as exc:
+                tui.server_msg("Error reloading %s: %s" % (fname, exc))
+            finally:
+                _script._end_load()
             return
 
         # ── /script (no args) — list with sha1sums ────────────────────────────
@@ -445,10 +465,10 @@ With -o: send output to the current channel (>2 lines prompts for stagger)."""
             tui.server_msg("script: no scripts in %s" % scripts_dir)
             return
 
-        col_w = max(len(f) for f in files)
-        tui.server_msg("scripts in %s" % scripts_dir)
-        tui.server_msg("  %-*s  sha1" % (col_w, "file"))
-        tui.server_msg("  %s  %s" % ("-" * col_w, "-" * 40))
+        from . import script as _script
+
+        # Build rows first so we know the max display-name width
+        rows = []
         for fname in files:
             fpath = os.path.join(scripts_dir, fname)
             try:
@@ -456,7 +476,16 @@ With -o: send output to the current channel (>2 lines prompts for stagger)."""
                     digest = hashlib.sha1(f.read()).hexdigest()
             except OSError:
                 digest = "(unreadable)"
-            tui.server_msg("  %-*s  %s" % (col_w, fname, digest))
+            loaded = _script.loaded_sha1(fname)
+            stale  = loaded is not None and loaded != digest
+            rows.append((fname + ("*" if stale else ""), digest))
+
+        col_w = max(len(name) for name, _ in rows)
+        tui.server_msg("scripts in %s" % scripts_dir)
+        tui.server_msg("  %-*s  sha1" % (col_w, "file"))
+        tui.server_msg("  %s  %s" % ("-" * col_w, "-" * 40))
+        for name, digest in rows:
+            tui.server_msg("  %-*s  %s" % (col_w, name, digest))
 
     def cmd_reload(args):
         """Reload all scripts from scripts_directory.  Usage: /reload"""

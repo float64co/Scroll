@@ -39,10 +39,15 @@ import time
 
 # ── internal state ────────────────────────────────────────────────────────────
 
-_handlers        = {}    # event_name (lower) → [callable, ...]
-_script_commands = set() # command names registered by scripts (for /reload)
-_irc             = None  # IRCClient, populated by _setup()
-_tui             = None  # ScrollTUI, populated by _setup()
+_handlers        = {}   # event_name → [(func, script_name, script_sha1), ...]
+_script_commands = {}   # command_name → script_name
+_script_loaded   = {}   # script_name → sha1 at load time
+_irc             = None
+_tui             = None
+
+# Set by _begin_load() before exec'ing a script so @on() can tag handlers.
+_current_script_name = None
+_current_script_sha1 = None
 
 
 def _setup(irc_obj, tui_obj):
@@ -54,12 +59,48 @@ def _setup(irc_obj, tui_obj):
 
 def _clear():
     """Remove all script-registered handlers and commands (used by /reload)."""
-    global _handlers, _script_commands
+    global _handlers, _script_commands, _script_loaded
     if _tui:
         for cmd in _script_commands:
             _tui.commands.pop(cmd, None)
     _handlers        = {}
-    _script_commands = set()
+    _script_commands = {}
+    _script_loaded   = {}
+
+
+def _clear_script(fname):
+    """Remove handlers and commands registered by *fname* only."""
+    global _handlers, _script_commands, _script_loaded
+    for key in list(_handlers):
+        _handlers[key] = [(f, sn, sh) for f, sn, sh in _handlers[key] if sn != fname]
+        if not _handlers[key]:
+            del _handlers[key]
+    to_remove = [cmd for cmd, sn in _script_commands.items() if sn == fname]
+    for cmd in to_remove:
+        del _script_commands[cmd]
+        if _tui:
+            _tui.commands.pop(cmd, None)
+    _script_loaded.pop(fname, None)
+
+
+def _begin_load(fname, sha1):
+    """Mark *fname* as the script currently being loaded."""
+    global _current_script_name, _current_script_sha1
+    _current_script_name = fname
+    _current_script_sha1 = sha1
+    _script_loaded[fname] = sha1
+
+
+def _end_load():
+    """Clear the current-script context after exec."""
+    global _current_script_name, _current_script_sha1
+    _current_script_name = None
+    _current_script_sha1 = None
+
+
+def loaded_sha1(fname):
+    """Return the sha1 stored when *fname* was last loaded, or None."""
+    return _script_loaded.get(fname)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
@@ -84,7 +125,7 @@ def on(event):
     """
     def decorator(func):
         key = event.lower()
-        _handlers.setdefault(key, []).append(func)
+        _handlers.setdefault(key, []).append((func, _current_script_name, _current_script_sha1))
         if key.startswith("command:"):
             _register_command(key[8:], func)
         return func
@@ -99,7 +140,7 @@ def fire(event, **kwargs):
     Called from ScrollTUI._fire() for IRC events.
     """
     key = event.lower()
-    for func in list(_handlers.get(key, [])):
+    for func, _sn, _sh in list(_handlers.get(key, [])):
         try:
             if key.startswith("command:"):
                 func(kwargs.get("args", ""))
@@ -122,7 +163,7 @@ def echo(target, text):
 def _register_command(name, func):
     """Register *func* as the handler for /<name>."""
     name = name.lower()
-    _script_commands.add(name)
+    _script_commands[name] = _current_script_name
     if _tui:
         def _wrapper(args, _f=func):
             try:
