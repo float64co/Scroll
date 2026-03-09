@@ -37,6 +37,22 @@ def display_width(text):
     return width
 
 
+def skip_display_cols(text, skip):
+    """Return the suffix of *text* starting after *skip* display columns."""
+    col = 0
+    for i, ch in enumerate(text):
+        if col >= skip:
+            return text[i:]
+        eaw = unicodedata.east_asian_width(ch)
+        if eaw in ("W", "F"):
+            col += 2
+        elif unicodedata.category(ch) in ("Mn", "Cf", "Me"):
+            pass
+        else:
+            col += 1
+    return ""
+
+
 def truncate_to_display_width(text, max_cols):
     """Return the longest prefix of *text* whose display width <= *max_cols*."""
     width = 0
@@ -86,17 +102,18 @@ class Window(object):
     Higher values can be used for wall clocks, etc.
     """
     def __init__(self, blocking=True):
-        self.blocking   = blocking
-        self.running    = None
-        self.debug      = None
-        self.window     = None
-        self.height     = None
-        self.width      = None
-        self.panes      = []
-        self.pane_cache = []
-        self.exit_keys  = []
-        self.friendly   = True
-        self.delay      = 0.030
+        self.blocking    = blocking
+        self.running     = None
+        self.debug       = None
+        self.window      = None
+        self.height      = None
+        self.width       = None
+        self.panes       = []
+        self.pane_cache  = []
+        self.exit_keys   = []
+        self.friendly    = True
+        self.delay       = 0.030
+        self.cursor_pos  = None  # (row, col) claimed by a pane each draw cycle
 
     def start(self):
         """Window event loop."""
@@ -110,7 +127,6 @@ class Window(object):
         _curses.noecho()
         _curses.cbreak()
         _curses.nonl()
-        _curses.curs_set(0)
         if self.blocking:
             self.window.nodelay(0)
         else:
@@ -147,6 +163,7 @@ class Window(object):
         self.update_window_size()
         self.calculate_pane_heights_and_widths()
         self.coordinate()
+        self.cursor_pos = None
         [pane.update() for pane in self if not pane.hidden]
 
         for pane in self:
@@ -275,6 +292,26 @@ class Window(object):
                 x = display_width(line)
                 y += i
 
+        # Position the hardware cursor for whichever pane claimed it.
+        # leaveok(1) tells ncurses it need not restore the cursor after a
+        # refresh, so we must flip it off when we actually want the cursor
+        # at a specific cell, then flip it back on when we don't.
+        try:
+            if self.cursor_pos is not None:
+                r, c = self.cursor_pos
+                if 0 <= r < self.height and 0 <= c < self.width:
+                    _curses.curs_set(1)
+                    self.window.leaveok(0)
+                    self.window.move(r, c)
+                else:
+                    _curses.curs_set(0)
+                    self.window.leaveok(1)
+            else:
+                _curses.curs_set(0)
+                self.window.leaveok(1)
+        except Exception:
+            pass
+
     def process_input(self):
         try:
             character = self.window.getch()
@@ -378,20 +415,16 @@ class Window(object):
                             for x in range(g):
                                 if rmg == x:
                                     p.height -= g - (x + 1)
-                            if self.height % 2:
-                                p.height += (1 if not claimed_columns else -claimed_columns)
-                            else:
-                                p.height -= claimed_columns
+                        # coordinate() advances y by ch+1 for multi-row panes, so
+                        # every EXPAND pane must yield one row to avoid wasted space.
+                        p.height = max(0, p.height - 1)
                 else:
                     pane.height = share
                     if not i:
                         for x in range(g):
                             if rmg == x:
                                 pane.height -= g - (x + 1)
-                        if self.height % 2:
-                            pane.height += (1 if not claimed_columns else -claimed_columns)
-                        else:
-                            pane.height -= claimed_columns
+                    pane.height = max(0, pane.height - 1)
 
         # ---- width pass ---- #
         for v_index, element in enumerate(self.panes):
@@ -809,30 +842,53 @@ class Menu(Pane):
 
 
 class Editor(Pane):
-    """Simple text editor / input pane."""
+    """Single- or multi-line text editor pane with a hardware cursor."""
     geometry = [EXPAND, EXPAND]
-    buffer   = ""
+
+    def __init__(self, name):
+        super().__init__(name)
+        self.buffer = ""
+        self.cursor = 0   # byte offset into buffer
 
     def update(self):
-        if len(self.content) >= 1:
-            self.change_content(1, "%i\n" % len(self.buffer))
+        self.change_content(0, self.buffer, ALIGN_LEFT, 0)
+        # Claim the hardware cursor
+        if self.window and self.coords:
+            top, left = self.coords[0][0]
+            before      = self.buffer[:self.cursor]
+            row_offset  = before.count("\n")
+            col_text    = before[before.rfind("\n") + 1:]
+            self.window.cursor_pos = (top + row_offset, left + display_width(col_text))
 
     def process_input(self, character):
         self.window.window.clear()
-        if character == 23 and self.buffer:
-            self.buffer = ''
-        elif character == 263 and self.buffer:
-            self.buffer = self.buffer[:-1]
-        elif character in (10, 13):
-            self.buffer += "\n"
+        if character == 260:                        # Left
+            self.cursor = max(0, self.cursor - 1)
+        elif character == 261:                      # Right
+            self.cursor = min(len(self.buffer), self.cursor + 1)
+        elif character in (263, 127, 8):            # Backspace
+            if self.cursor > 0:
+                self.buffer = self.buffer[:self.cursor - 1] + self.buffer[self.cursor:]
+                self.cursor -= 1
+        elif character == 23:                       # Ctrl+W — kill word
+            before = self.buffer[:self.cursor].rstrip()
+            cut    = before.rsplit(" ", 1)
+            new_before = cut[0] + " " if len(cut) > 1 else ""
+            self.buffer = new_before + self.buffer[self.cursor:]
+            self.cursor = len(new_before)
+        elif character == 21:                       # Ctrl+U — kill line
+            self.buffer = self.buffer[self.cursor:]
+            self.cursor = 0
+        elif character in (10, 13):                 # Enter — newline
+            self.buffer = self.buffer[:self.cursor] + "\n" + self.buffer[self.cursor:]
+            self.cursor += 1
         else:
             try:
-                self.buffer += chr(character)
+                ch = chr(character)
+                self.buffer = self.buffer[:self.cursor] + ch + self.buffer[self.cursor:]
+                self.cursor += 1
             except Exception:
                 pass
-        import random
-        colours = palette(-1, random.choice(["blue", "red"]))
-        self.change_content(0, self.buffer, ALIGN_LEFT, colours)
 
 
 class Pager(Pane):

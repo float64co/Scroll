@@ -22,7 +22,7 @@ from .window import (
     Window, Pane, palette,
     EXPAND, FIT,
     ALIGN_LEFT, ALIGN_RIGHT, ALIGN_CENTER,
-    display_width, truncate_to_display_width,
+    display_width, truncate_to_display_width, skip_display_cols,
 )
 
 # ── colour constants (initialised lazily on first use) ──────────────────────
@@ -208,19 +208,33 @@ class NickPane(Pane):
         self._buf     = buf_ref
         self._tui     = tui_ref
         self.selected = 0
+        self._scroll  = 0   # index of top visible nick
+
+    def _clamp_scroll(self, total):
+        """Keep _scroll so that selected is always visible."""
+        vis = max(1, self.height or 1)
+        if self.selected < self._scroll:
+            self._scroll = self.selected
+        elif self.selected >= self._scroll + vis:
+            self._scroll = self.selected - vis + 1
+        self._scroll = max(0, min(self._scroll, max(0, total - vis)))
 
     def update(self):
         buf = self._buf()
         if buf is None:
             return
         focused = self._tui._focus == "nicks"
-        nicks   = sort_nicks(buf.nicks)[:self.height or 9999]
-        self.selected = min(self.selected, max(0, len(nicks) - 1))
-        self.content  = []
-        for i, n in enumerate(nicks):
-            text = truncate_to_display_width(n, self.NICK_WIDTH - 1)
-            text = text + " " * max(0, self.NICK_WIDTH - 1 - display_width(text))
-            attrs = palette("black", "white") if (focused and i == self.selected) else 0
+        nicks   = sort_nicks(buf.nicks)
+        total   = len(nicks)
+        self.selected = min(self.selected, max(0, total - 1))
+        self._clamp_scroll(total)
+        vis     = max(1, self.height or 1)
+        visible = nicks[self._scroll:self._scroll + vis]
+        self.content = []
+        for i, n in enumerate(visible):
+            text  = truncate_to_display_width(n, self.NICK_WIDTH - 1)
+            text  = text + " " * max(0, self.NICK_WIDTH - 1 - display_width(text))
+            attrs = palette("black", "white") if (focused and self._scroll + i == self.selected) else 0
             self.content.append([text + "\n", ALIGN_LEFT, attrs])
 
     def process_input(self, character):
@@ -228,20 +242,49 @@ class NickPane(Pane):
             return
         buf   = self._buf()
         nicks = sort_nicks(buf.nicks) if buf else []
-        if character == 259:       # up
+        total = len(nicks)
+        vis   = max(1, self.height or 1)
+
+        if character == 259:       # Up — scroll list if at top of view
             self.selected = max(0, self.selected - 1)
+            self._clamp_scroll(total)
             self.window.window.clear()
-        elif character == 258:     # down
-            self.selected = min(max(0, len(nicks) - 1), self.selected + 1)
+        elif character == 258:     # Down — scroll list if at bottom of view
+            self.selected = min(max(0, total - 1), self.selected + 1)
+            self._clamp_scroll(total)
+            self.window.window.clear()
+        elif character == 339:     # PgUp
+            if self.selected > self._scroll:
+                self.selected = self._scroll          # first: jump to top of view
+            else:
+                self.selected = max(0, self.selected - vis)
+            self._clamp_scroll(total)
+            self.window.window.clear()
+        elif character == 338:     # PgDn
+            bottom = self._scroll + vis - 1
+            if self.selected < bottom and self.selected < total - 1:
+                self.selected = min(total - 1, bottom)  # first: jump to bottom of view
+            else:
+                self.selected = min(max(0, total - 1), self.selected + vis)
+            self._clamp_scroll(total)
+            self.window.window.clear()
+        elif character == 262:     # Home — first nick
+            self.selected = 0
+            self._scroll  = 0
+            self.window.window.clear()
+        elif character == 360:     # End — last nick
+            self.selected = max(0, total - 1)
+            self._clamp_scroll(total)
             self.window.window.clear()
         elif character in (10, 13):  # Enter — open submenu
-            if 0 <= self.selected < len(nicks):
+            if 0 <= self.selected < total:
                 nick = nicks[self.selected].lstrip("~&@%+")
                 menu = self.window.get("nickmenu")
                 if menu:
                     menu.open(nick)
                     self._tui.set_focus("menu")
-        elif character == 9:       # Tab — return to input
+        elif character == 9:       # Tab — return to input (flag allows one Tab back)
+            self._tui._nick_tab_pending = True
             self._tui.set_focus("input")
         elif character == 27:      # ESC — return to input
             self._tui.set_focus("input")
@@ -317,10 +360,11 @@ class NickMenuPane(Pane):
             self.window.window.clear()
         elif character in (10, 13):  # Enter — execute
             self._execute(MENU_ITEMS[self.selected][1])
-        elif character == 9:       # Tab — close menu, return to input
+        elif character == 9:       # Tab — close menu, return to input (flag allows one Tab back)
+            self._tui._nick_tab_pending = True
             self._tui.set_focus("input")
             self.window.window.clear()
-        elif character == 27:      # ESC — back to nick list
+        elif character == 27:      # ESC — close menu, return to nick list
             self._tui.set_focus("nicks")
             self.window.window.clear()
 
@@ -410,50 +454,89 @@ class InputPane(Pane):
 
     def __init__(self, buf_ref, tui_ref):
         super().__init__("input")
-        self.buffer     = ""
-        self.cursor     = 0
-        self._on_submit = None   # set by ScrollTUI
-        self._buf       = buf_ref
-        self._tui       = tui_ref
-        self._tab_state = None   # completion state while cycling
-        self._history   = []     # submitted lines, oldest first
-        self._hist_pos  = -1     # -1 = not browsing history
-        self._hist_draft = ""    # saved current input while browsing
+        self.buffer      = ""
+        self.cursor      = 0
+        self._on_submit  = None   # set by ScrollTUI
+        self._buf        = buf_ref
+        self._tui        = tui_ref
+        self._tab_state  = None   # completion state while cycling
+        self._history    = []     # submitted lines, oldest first
+        self._hist_pos   = -1     # -1 = not browsing history
+        self._hist_draft = ""     # saved current input while browsing
+        self._view_start = 0      # display-column offset for horizontal scroll
 
     def update(self):
         attrs  = 0
         buf    = self._buf()
         name   = buf.name if buf else ""
         prompt = "[%s] " % name
-        text   = prompt + self.buffer
-        w = self.width or 80
-        text = truncate_to_display_width(text, w)
+        w        = self.width or 80
+        prompt_w = display_width(prompt)
+        avail_w  = max(1, w - prompt_w)
+
+        # Cursor position in display columns within the buffer
+        buf_cursor_col = display_width(self.buffer[:self.cursor])
+
+        # Clamp view start so the cursor stays visible
+        if buf_cursor_col < self._view_start:
+            self._view_start = buf_cursor_col
+        elif buf_cursor_col >= self._view_start + avail_w:
+            self._view_start = buf_cursor_col - avail_w + 1
+        self._view_start = max(0, self._view_start)
+
+        # Render: prompt + the visible slice of the buffer
+        visible = truncate_to_display_width(
+            skip_display_cols(self.buffer, self._view_start), avail_w)
+        text = prompt + visible
         text = text + " " * max(0, w - display_width(text))
         self.content = [[text, ALIGN_LEFT, attrs]]
 
+        # Claim the hardware cursor when this pane has focus
+        if self._tui._focus == "input" and self.window and self.coords:
+            top, left = self.coords[0][0]
+            screen_col = left + prompt_w + (buf_cursor_col - self._view_start)
+            self.window.cursor_pos = (top, min(screen_col, w - 1))
+
     def process_input(self, character):
-        if self._tui._focus != "input":
+        if self._tui._focus_at_cycle_start != "input":
             return
 
         if character == 9:   # Tab
-            if not self._try_complete():
+            if self._tui._nick_tab_pending:
+                # User just tabbed here from the nick list — send them back
+                self._tui._nick_tab_pending = False
+                self._tui.set_focus("nicks")
+            elif not self._try_complete():
+                # No completion candidate; switch to nick list (and remember it)
+                self._tui._nick_tab_pending = True
                 self._tui.set_focus("nicks")
             return
 
-        # Any non-Tab key resets completion state
+        # Any non-Tab key resets completion state and the nick-tab flag
         self._tab_state = None
+        self._tui._nick_tab_pending = False
+
+        # Force a full redraw on every keypress so the cursor is always
+        # repositioned to the input bar by the next draw cycle.
+        if self.window and self.window.window:
+            self.window.window.clear()
 
         if character in (10, 13):           # Enter → submit
             line = self.buffer
             self.buffer = ""
             self.cursor = 0
-            self._hist_pos  = -1
+            self._hist_pos   = -1
             self._hist_draft = ""
             if self._on_submit and line.strip():
                 if not self._history or self._history[-1] != line:
                     self._history.append(line)
                 self._on_submit(line)
-            self.window.window.clear()
+        elif character == 260:              # Left
+            self.cursor = max(0, self.cursor - 1)
+            self._hist_pos = -1
+        elif character == 261:              # Right
+            self.cursor = min(len(self.buffer), self.cursor + 1)
+            self._hist_pos = -1
         elif character == 259:              # Up — older history
             if self._history:
                 if self._hist_pos == -1:
@@ -462,7 +545,7 @@ class InputPane(Pane):
                 elif self._hist_pos > 0:
                     self._hist_pos -= 1
                 self.buffer = self._history[self._hist_pos]
-                self.window.window.clear()
+                self.cursor = len(self.buffer)
         elif character == 258:              # Down — newer history
             if self._hist_pos != -1:
                 if self._hist_pos < len(self._history) - 1:
@@ -471,22 +554,36 @@ class InputPane(Pane):
                 else:
                     self._hist_pos = -1
                     self.buffer = self._hist_draft
-                self.window.window.clear()
-        elif character in (263, 127, 8):    # Backspace
-            if self.buffer:
-                self.buffer = self.buffer[:-1]
+                self.cursor = len(self.buffer)
+        elif character in (263, 127, 8):    # Backspace — delete before cursor
+            if self.cursor > 0:
+                self.buffer = self.buffer[:self.cursor - 1] + self.buffer[self.cursor:]
+                self.cursor -= 1
                 self._hist_pos = -1
-                self.window.window.clear()
-        elif character == 23:               # Ctrl+W — kill word
-            parts = self.buffer.rstrip().rsplit(" ", 1)
-            self.buffer = parts[0] + " " if len(parts) > 1 else ""
+        elif character == 23:               # Ctrl+W — kill word before cursor
+            before     = self.buffer[:self.cursor].rstrip()
+            cut        = before.rsplit(" ", 1)
+            new_before = cut[0] + " " if len(cut) > 1 else ""
+            self.buffer    = new_before + self.buffer[self.cursor:]
+            self.cursor    = len(new_before)
             self._hist_pos = -1
-        elif character == 21:               # Ctrl+U — kill line
-            self.buffer = ""
+        elif character == 21:               # Ctrl+U — kill to start of line
+            self.buffer    = self.buffer[self.cursor:]
+            self.cursor    = 0
             self._hist_pos = -1
+        elif character == 262:              # Home — start of line
+            buf = self._buf()
+            if not buf or getattr(buf, "kind", None) != "doc":
+                self.cursor = 0
+        elif character == 360:              # End — end of line
+            buf = self._buf()
+            if not buf or getattr(buf, "kind", None) != "doc":
+                self.cursor = len(self.buffer)
         elif 32 <= character < 127 or 160 <= character < 256:
             try:
-                self.buffer += chr(character)
+                ch = chr(character)
+                self.buffer = self.buffer[:self.cursor] + ch + self.buffer[self.cursor:]
+                self.cursor += 1
                 self._hist_pos = -1
             except Exception:
                 pass
@@ -542,6 +639,7 @@ class InputPane(Pane):
         else:
             suffix = ": " if s["first"] else " "
             self.buffer = self.buffer[:s["word_start"]] + candidate + suffix
+        self.cursor = len(self.buffer)
         if self.window:
             self.window.window.clear()
 
@@ -560,10 +658,12 @@ class ScrollTUI:
         self.irc        = None     # set by caller
         self.commands   = {}       # name → (func, docstring)
         self._window    = None
-        self._confirm      = None     # pending confirmation: {"prompt", "yes_cb", "no_cb"}
-        self._focus        = "input"  # "input" | "nicks" | "menu"
-        self._list_results = None     # collecting 322 replies; None = not in a /list
-        self._list_filters = {}       # min_users, max_users
+        self._confirm          = None     # pending confirmation: {"prompt", "yes_cb", "no_cb"}
+        self._focus            = "input"  # "input" | "nicks" | "menu"
+        self._list_results     = None     # collecting 322 replies; None = not in a /list
+        self._list_filters     = {}       # min_users, max_users
+        self._nick_tab_pending    = False   # one Tab from input returns to nick list
+        self._focus_at_cycle_start = "input"  # snapshot before pane dispatch
 
         # server buffer is always index 0; irc is wired later by caller
         buf = self._add_buffer("server")

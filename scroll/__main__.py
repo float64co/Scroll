@@ -569,6 +569,12 @@ def patch_alt_keys(win, tui):
                 _esc_pending[0] = False
                 # fall through and dispatch character normally
         elif character == 27:
+            if tui._focus == "menu":
+                # Dispatch ESC immediately — no Alt+digit ambiguity in menu mode
+                for pane in win:
+                    if pane.active:
+                        pane.process_input(27)
+                return
             _esc_pending[0] = True
             return
 
@@ -696,8 +702,18 @@ def main():
     win = tui.build_window()
     patch_alt_keys(win, tui)
 
-    # Wire IRC poll + topic refresh into the cycle; poll every connected client
-    original_cycle = win.cycle
+    # Wire IRC poll + topic refresh into the cycle; poll every connected client.
+    # Patch win.draw so overlays (nick menu) are composited after the base layout
+    # but before process_input()'s getch() triggers the terminal refresh.
+    original_draw = win.draw
+
+    def patched_draw():
+        original_draw()
+        tui.draw_overlays()
+
+    win.draw = patched_draw
+
+    original_cycle = win.cycle  # cycle() calls self.draw() = patched_draw above
 
     def patched_cycle():
         for buf in list(tui.buffers):
@@ -705,8 +721,8 @@ def main():
                 buf.irc.poll()
         tui.refresh_topic()
         tui.refresh_side_panels()
+        tui._focus_at_cycle_start = tui._focus
         original_cycle()
-        tui.draw_overlays()
 
     win.cycle = patched_cycle
 
