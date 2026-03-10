@@ -44,7 +44,7 @@ class _PostDevelop(develop):
 
 setup(
     name="scroll",
-    version="0.1.0",
+    version="0.0.3",
     packages=find_packages(),
     package_data={"scroll": ["docs/*.txt"]},
     entry_points={

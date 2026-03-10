@@ -846,7 +846,8 @@ class ScrollTUI:
                     self._fire("action", nick=nick, target=target, text=ctcp_arg, raw=raw)
 
                 elif ctcp_cmd == "VERSION":
-                    c.notice(nick, "\x01VERSION scroll\x01")
+                    from . import __version__
+                    c.notice(nick, "\x01VERSION scroll %s\x01" % __version__)
                     self.server_msg("CTCP VERSION from %s" % nick, client=c)
 
                 elif ctcp_cmd == "PING":

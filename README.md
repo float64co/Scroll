@@ -1,4 +1,4 @@
-![scroll](img/scroll.png)
+![scroll](img/scroll2.png)
 
 A terminal IRC client written in Python.
 
@@ -6,9 +6,9 @@ A terminal IRC client written in Python.
 ![screenshot](img/scroll_screenshot.gif)
 
 ```
-Usage: scroll [--help] [--headless]
+Usage: scroll [--help] [--version] [--headless]
 
-scroll is a minimal irssi-inspired IRC client.
+scroll 0.0.3 — a minimal irssi-inspired IRC client.
 
 Configuration is read from config.hcl (searched in the project directory,
 ~/.config/scroll/config.hcl, and ~/.scroll/config.hcl).

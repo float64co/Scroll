@@ -622,10 +622,12 @@ def patch_alt_keys(win, tui):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
-HELP_TEXT = """\
-Usage: scroll [--help] [--headless]
+from . import __version__
 
-scroll is a minimal irssi-inspired IRC client.
+HELP_TEXT = """\
+Usage: scroll [--help] [--version] [--headless]
+
+scroll %s — a minimal irssi-inspired IRC client.""" % __version__ + """
 
 Configuration is read from config.hcl (searched in the project directory,
 ~/.config/scroll/config.hcl, and ~/.scroll/config.hcl).
@@ -678,6 +680,10 @@ def daemonize():
 def main():
     if "--help" in sys.argv or "-h" in sys.argv:
         print(HELP_TEXT, end="")
+        sys.exit(0)
+
+    if "--version" in sys.argv or "-v" in sys.argv:
+        print("scroll %s" % __version__)
         sys.exit(0)
 
     headless = "--headless" in sys.argv
