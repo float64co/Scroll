@@ -1,4 +1,4 @@
-![scroll](img/scroll2.png)
+![scroll](img/scroll.png)
 
 A terminal IRC client written in Python.
 
