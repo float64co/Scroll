@@ -751,8 +751,14 @@ def main():
         if tui._window:
             tui._window.running = False
 
+    def handle_sighup(sig, frame):
+        from . import script as _script
+        _script._clear()
+        load_scripts(cfg.get("scripts_directory"), tui)
+
     signal.signal(signal.SIGINT,  handle_sigint)
     signal.signal(signal.SIGTERM, handle_sigint)
+    signal.signal(signal.SIGHUP,  handle_sighup)
 
     if headless:
         tui.server_msg = lambda *a, **kw: None
