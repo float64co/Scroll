@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 # Defines a simple ncurses window, an event loop and some panes.
 import locale
+import re
 import time
 import unicodedata
 import _curses
@@ -17,14 +18,115 @@ ALIGN_LEFT   = "ALIGN_LEFT"   # values for the align argument to Pane.change_con
 ALIGN_RIGHT  = "ALIGN_RIGHT"
 ALIGN_CENTER = "ALIGN_CENTER"
 
+# ---------------------------------------------------------------------------
+# IRC colour / formatting helpers
+# ---------------------------------------------------------------------------
+
+# Matches \x03[FG[,BG]] or any of the single-byte formatting controls.
+_IRC_RE = re.compile(
+    r'\x03(?:([0-9]{1,2})(?:,([0-9]{1,2}))?)?'
+    r'|[\x02\x0f\x1d\x1f\x16\x1e]'
+)
+
+# IRC colour numbers 0-15 → nearest curses colour integer (0-7).
+_IRC_COLOR_MAP = (
+    7,  # 0  white
+    0,  # 1  black
+    4,  # 2  navy/blue
+    2,  # 3  green
+    1,  # 4  red
+    1,  # 5  brown   → red
+    5,  # 6  purple  → magenta
+    3,  # 7  orange  → yellow
+    3,  # 8  yellow
+    2,  # 9  lime    → green
+    6,  # 10 teal    → cyan
+    6,  # 11 aqua    → cyan
+    4,  # 12 royal   → blue
+    5,  # 13 pink    → magenta
+    0,  # 14 grey    → black
+    7,  # 15 silver  → white
+)
+
+
+def irc_strip(text):
+    """Remove all IRC colour/format control codes from *text*."""
+    return _IRC_RE.sub('', text)
+
+
+def irc_parse_segments(text, base_attrs=0):
+    """
+    Split *text* into ``(plain_str, curses_attrs)`` pairs, interpreting
+    embedded IRC colour/format codes.  Control codes are consumed; plain
+    strings contain only printable characters.
+    Requires curses to have been initialised (called inside the draw loop).
+    """
+    segments = []
+    pos       = 0
+    buf       = []
+    cur_fg    = -1   # -1 = terminal default
+    cur_bg    = -1
+    bold      = False
+    underline = False
+    reverse   = False
+
+    def _attrs():
+        a = base_attrs
+        if cur_fg != -1 or cur_bg != -1:
+            a = palette(
+                _IRC_COLOR_MAP[cur_fg % 16] if cur_fg != -1 else -1,
+                _IRC_COLOR_MAP[cur_bg % 16] if cur_bg != -1 else -1,
+            )
+        if bold:
+            a |= _curses.A_BOLD
+        if underline:
+            a |= _curses.A_UNDERLINE
+        if reverse:
+            a |= _curses.A_REVERSE
+        return a
+
+    while pos < len(text):
+        m = _IRC_RE.match(text, pos)
+        if not m:
+            buf.append(text[pos])
+            pos += 1
+            continue
+        if buf:
+            segments.append((''.join(buf), _attrs()))
+            buf = []
+        code = text[pos]
+        if code == '\x03':
+            if m.group(1) is not None:
+                cur_fg = int(m.group(1))
+                cur_bg = int(m.group(2)) if m.group(2) is not None else -1
+            else:
+                cur_fg = cur_bg = -1          # bare \x03 = colour reset
+        elif code == '\x02':
+            bold = not bold
+        elif code == '\x0f':                  # reset all
+            cur_fg = cur_bg = -1
+            bold = underline = reverse = False
+        elif code == '\x1f':
+            underline = not underline
+        elif code == '\x16':
+            reverse = not reverse
+        # \x1d (italic) and \x1e — no curses equivalent, ignore
+        pos = m.end()
+
+    if buf:
+        segments.append((''.join(buf), _attrs()))
+    return segments or [('', base_attrs)]
+
 
 def display_width(text):
     """
     Return the number of terminal columns required to display *text*.
     Full-width (F) and Wide (W) Unicode characters each occupy two columns;
     combining / zero-width characters occupy zero columns.
+    IRC colour/format codes are stripped before measurement.
     All other characters occupy one column.
     """
+    text  = irc_strip(text)
     width = 0
     for ch in text:
         eaw = unicodedata.east_asian_width(ch)
@@ -38,11 +140,18 @@ def display_width(text):
 
 
 def skip_display_cols(text, skip):
-    """Return the suffix of *text* starting after *skip* display columns."""
+    """Return the suffix of *text* starting after *skip* display columns.
+    IRC formatting codes are passed through without advancing the column count."""
     col = 0
-    for i, ch in enumerate(text):
+    i   = 0
+    while i < len(text):
         if col >= skip:
             return text[i:]
+        m = _IRC_RE.match(text, i)
+        if m:
+            i = m.end()
+            continue
+        ch  = text[i]
         eaw = unicodedata.east_asian_width(ch)
         if eaw in ("W", "F"):
             col += 2
@@ -50,14 +159,23 @@ def skip_display_cols(text, skip):
             pass
         else:
             col += 1
+        i += 1
     return ""
 
 
 def truncate_to_display_width(text, max_cols):
-    """Return the longest prefix of *text* whose display width <= *max_cols*."""
+    """Return the longest prefix of *text* whose display width <= *max_cols*.
+    IRC formatting codes are preserved in the output but not counted."""
     width = 0
     out   = []
-    for ch in text:
+    i     = 0
+    while i < len(text):
+        m = _IRC_RE.match(text, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        ch  = text[i]
         eaw = unicodedata.east_asian_width(ch)
         if eaw in ("W", "F"):
             ch_w = 2
@@ -69,6 +187,7 @@ def truncate_to_display_width(text, max_cols):
             break
         out.append(ch)
         width += ch_w
+        i += 1
     return "".join(out)
 
 
@@ -273,9 +392,9 @@ class Window(object):
                                         if not c:
                                             y -= 1
                                         t = truncate_to_display_width('...', avail)
-                                        self.addstr(top_left_top + i + y, top_left_left + x, t, attrs)
+                                        self.addstr_rich(top_left_top + i + y, top_left_left + x, t, attrs)
                                         continue
-                                self.addstr(top_left_top + i + y, top_left_left + x, j, attrs)
+                                self.addstr_rich(top_left_top + i + y, top_left_left + x, j, attrs)
                                 x += display_width(j)
 
                             x = 0
@@ -283,11 +402,11 @@ class Window(object):
 
                     # ---- draw ---- #
                     if top_left_top > top_right_top and y >= top_left_top:
-                        self.addstr(top_left_top + i + y, bottom_left_left + x, line, attrs)
+                        self.addstr_rich(top_left_top + i + y, bottom_left_left + x, line, attrs)
                     elif bottom_left_top < bottom_right_top and y >= bottom_left_top:
-                        self.addstr(top_left_top + i + y, bottom_left_left + x, line, attrs)
+                        self.addstr_rich(top_left_top + i + y, bottom_left_left + x, line, attrs)
                     else:
-                        self.addstr(top_left_top + i + y, top_left_left + x, line, attrs)
+                        self.addstr_rich(top_left_top + i + y, top_left_left + x, line, attrs)
                     x = 0
 
                 x = display_width(line)
@@ -545,6 +664,14 @@ class Window(object):
             self.window.addstr(h, w, text, attrs)
         except Exception:
             pass
+
+    def addstr_rich(self, h, w, text, attrs=0):
+        """Like addstr but interprets IRC colour/format codes in *text*."""
+        col = w
+        for seg, seg_attrs in irc_parse_segments(text, attrs):
+            if seg:
+                self.addstr(h, col, seg, seg_attrs)
+                col += display_width(seg)
 
     def update_window_size(self):
         height, width = self.window.getmaxyx()
